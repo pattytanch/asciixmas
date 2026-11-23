@@ -1,0 +1,883 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="theme-color" content="#000000">
+<title>The Fir &amp; the Dachshund</title>
+<style>
+  * { box-sizing: border-box }
+  body { margin: 0; background: #000; color: #e4dcce; color-scheme: dark }
+  main { min-height: 100svh; display: grid; place-content: center; justify-items: center }
+  canvas { display: block; width: min(100vw, 150svh, 1500px); height: min(87svh, 104vw, 970px); cursor: pointer; }
+  button { width: 44px; height: 44px; display: grid; place-items: center; background: #080a09;
+    border: 1px solid #3f4844; border-radius: 50%; cursor: pointer; color: #dce4db; }
+  button:focus-visible { outline: 2px solid #e8c886; outline-offset: 4px; }
+  @media (hover:hover) { button:hover { color: #fff3cb; border-color: #998467; } }
+  .controls { display: flex; gap: 14px; }
+  .icon { width: 12px; height: 14px; border-left: 4px solid; border-right: 4px solid; }
+  button[data-playing="false"] .icon { width: 0; height: 0; margin-left: 3px; border: 0;
+    border-left: 11px solid currentColor; border-top: 7px solid transparent; border-bottom: 7px solid transparent; }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="scene" width="800" height="640" role="img" aria-label="On black, drawn in text: a strand spelling O Christmas Tree winds upward into a turning fir lettered with carols, standing in shaded snowdrifts that glint as snow falls past in layers. Fairy lights sparkle among the boughs and a few glass baubles hang under the branch tips. Presents tagged To You and Open Me drop out of twinkles in the air, squash, bounce and pop their lids, and a dachshund in a floppy Santa hat trots up and sneezes when a snowflake lands on its nose. The sneeze shakes the tree, its lights stutter, the presents jump, and snow tumbles off the boughs onto the dachshund&#39;s hat."></canvas>
+  <div class="controls">
+    <button id="replay" type="button" aria-label="Replay from the start">
+      <svg aria-hidden="true" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+        stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M3 12a9 9 0 1 0 2.64-6.36L3 8"/><path d="M3 3v5h5"/>
+      </svg>
+    </button>
+    <button id="playback" type="button" aria-label="Pause animation"><span aria-hidden="true" class="icon"></span></button>
+  </div>
+</main>
+<script>
+'use strict';
+// The Fir & the Dachshund: a looping ASCII Christmas scene on one canvas. A strand spells out a
+// carol as it winds up into a turning fir lettered with Christmas words; fairy lights, baubles
+// and the star come on; presents drop in; a dachshund in a Santa hat trots up, a snowflake lands
+// on its nose, and it sneezes, shaking snow off the tree onto its hat.
+//
+// Everything is laid out in an 800x640 scene space and scaled to fit the canvas. Shapes that never
+// change (the dog's poses, the presents, the snowfield, the tree's glyphs) are painted once at the
+// screen's pixel density and stamped every frame; see sharpen().
+
+// ---------- Setup and helpers ----------
+const view = document.querySelector('#scene');
+const ctx = view.getContext('2d');
+const button = document.querySelector('#playback');
+const motion = matchMedia('(prefers-reduced-motion: reduce)');
+const SIZE = 800, TAU = Math.PI * 2;
+const mono = 'Menlo, Consolas, "Liberation Mono", monospace';
+const clamp = n => Math.min(1, Math.max(0,n));
+const smooth = n => { n=clamp(n); return n*n*(3-2*n) };
+function hash(a,b) {
+  const v=Math.sin(a*127.1+b*311.7)*43758.5453;
+  return v-Math.floor(v);
+}
+// Shapes are painted in colour into this offscreen mask, then sampled into glyphs by etch().
+const mask = document.createElement('canvas');
+mask.width = mask.height = SIZE;
+const ink = mask.getContext('2d',{willReadFrequently:true});
+function shape(d,fill,edge,width=2) {
+  const p=new Path2D(d);
+  if(fill){ ink.fillStyle=fill; ink.fill(p) }
+  if(edge){ ink.strokeStyle=edge; ink.lineWidth=width; ink.stroke(p) }
+}
+function oval(x,y,rx,ry,color) {
+  ink.beginPath(); ink.ellipse(x,y,rx,ry,0,0,TAU); ink.fillStyle=color; ink.fill();
+}
+function rect(x,y,w,h,color) { ink.fillStyle=color; ink.fillRect(x,y,w,h) }
+function glyph(c,ch,x,y,color,size=9) {
+  c.fillStyle=color; c.font=size+'px '+mono; c.fillText(ch,x,y);
+}
+// The timeline, in milliseconds from the start of each loop.
+const startRise=460, fullTree=startRise+6100;            // the strand winds up, the boughs open
+const lightStart=fullTree+80, lightsReady=lightStart+780; // lights come on from the bottom up
+const enter=lightsReady+1250, arrived=enter+1920;        // the dog trots in
+const contact=arrived+1900, sneeze=contact+690;          // the flake lands on its nose; the sneeze
+const fade=sneeze+3350, cycle=fade+1400;                 // a pause, then fade out and loop
+
+// ---------- Painting shapes in type ----------
+// Sample the painted mask into glyph records, painted later at the screen's real resolution so
+// they stay crisp on high-density displays. Presents spell their `chars` along each row; the
+// dog's fur scatters them. Below y=498 the legs swing: rear ones (left of x=420) one way,
+// front ones the other. `flip` mirrors the shape about x=395 but keeps the glyphs upright,
+// which is how the dog turns to face the tree.
+function etch(chars,{stepX=4.4,stepY=5.4,size=7,stride=0,flip=false,spell=true}={}) {
+  const data=ink.getImageData(0,0,SIZE,SIZE).data, marks=[];
+  for(let y=2;y<SIZE;y+=stepY) for(let x=2;x<SIZE;x+=stepX) {
+    const sx=Math.round(x), sy=Math.round(y), i=4*(sy*SIZE+sx);
+    if(data[i+3]<100 || !(data[i]+data[i+1]+data[i+2])) continue;
+    const leg=clamp((sy-498)/25), at=sx+(sx>420?1:-1)*leg*stride;
+    const col=Math.round((flip?790-x:x)/stepX), line=Math.round(y/stepY);
+    const ch=spell?chars[(col+line*7)%chars.length]:chars[Math.floor(hash(sx,sy)*chars.length)];
+    marks.push({ch,x:flip?790-at:at,y:sy,size,color:'rgb('+data[i]+','+data[i+1]+','+data[i+2]+')'});
+  }
+  ink.clearRect(0,0,SIZE,SIZE);
+  return marks;
+}
+// Paint glyph records into a canvas cropped to their extent, at `scale` pixels per unit.
+function paintMarks(marks,scale,reach=[],solid=false) {
+  let left=Infinity,top=Infinity,right=-Infinity,bottom=-Infinity;
+  for(const {x,y} of [...marks,...reach]) {
+    left=Math.min(left,x); right=Math.max(right,x);
+    top=Math.min(top,y); bottom=Math.max(bottom,y);
+  }
+  left-=10; top-=10; right+=10; bottom+=10;
+  const el=document.createElement('canvas');
+  el.width=Math.ceil((right-left)*scale); el.height=Math.ceil((bottom-top)*scale);
+  const c=el.getContext('2d');
+  c.setTransform(scale,0,0,scale,-left*scale,-top*scale);
+  c.textAlign='center'; c.textBaseline='middle';
+  // Solid shapes get a black cell behind each letter, so nothing behind shows through.
+  if(solid) { c.fillStyle='#000'; for(const m of marks) c.fillRect(m.x-2.4,m.y-2.9,4.8,5.8); }
+  let font='';
+  for(const m of marks) {
+    const f=m.size+'px '+mono;
+    if(f!==font) c.font=font=f;
+    c.fillStyle=m.color; c.fillText(m.ch,m.x,m.y);
+  }
+  return {canvas:el,pen:c,x:left,y:top,w:el.width/scale,h:el.height/scale};
+}
+// ---------- The dachshund ----------
+// Puppy proportions: the head is drawn a little larger than the body calls for.
+const HEAD=1.1;
+// Head features turn (and grow) with the head around the neck.
+function aboutNeck(x,y,a) {
+  const dx=(x-461)*HEAD,dy=(y-453)*HEAD,c=Math.cos(a),s=Math.sin(a);
+  return [461+dx*c-dy*s,453+dx*s+dy*c];
+}
+const mirror=x=>790-x;
+// Where the nose sits on the head, before the head turns.
+const NOSE=[535,439];
+// The Santa hat sits on the crown, its tip flopped back. Points on it are in its own frame.
+const hatX=482, hatY=412, hatTilt=-.08, hatSize=.95;
+function onHat(x,y) {
+  const c=Math.cos(hatTilt)*hatSize,s=Math.sin(hatTilt)*hatSize;
+  return [hatX+x*c-y*s,hatY+x*s+y*c];
+}
+// The dachshund is drawn facing right in the mask, then mirrored to face the tree: a brown
+// coat with a sheen along its back, a dark floppy ear and a little smile.
+function dogFrame(pose,wag,earLift=0,stride=0) {
+  const coat='#a2602f', rim='#c27c45', dark='#7d4626';
+  shape('M362 494 L359 519 Q358 525 370 524 L374 522 L370 517 L379 497Z M450 496 L448 521 Q450 525 461 523 L462 520 L457 516 L465 496Z',dark);
+  shape(`M357 474 Q341 ${465-3*wag} ${334-4*wag} ${444-7*wag} Q333 ${436-7*wag} ${340-4*wag} ${439-6*wag} Q346 458 364 466Z`,coat,rim,2);
+  shape('M352 482 Q350 462 372 458 Q410 456 440 452 Q452 446 458 440 L478 442 Q488 470 476 488 Q468 498 462 500 L463 518 Q474 520 471 526 L454 526 L449 503 Q420 507 392 505 Q378 504 372 503 L368 519 Q379 521 375 526 L357 526 Q352 522 356 512 L357 500 Q348 494 352 482Z',coat,rim,3);
+  shape('M372 466 Q410 462 444 456',null,'#d38f57',4);
+  ink.save(); ink.translate(461,453); ink.rotate(pose); ink.scale(HEAD,HEAD); ink.translate(-461,-453);
+  // A long, gently tapering snout.
+  shape('M447 453 Q448 433 460 421 Q473 408 490 410 Q506 412 513 426 L533 434 Q543 437 538 445 Q531 452 512 450 Q495 456 482 468Z',coat,rim,3);
+  // The felt cap's bent tip and pom flop backwards and swing on the sneeze.
+  ink.save(); ink.translate(hatX,hatY); ink.rotate(hatTilt+earLift*.32); ink.scale(hatSize,hatSize);
+  shape('M17 3 Q16 -11 8 -25 Q2 -37 -8 -32 Q-17 -26 -15 -13 Q-10 -22 -5 -21 Q-6 -10 -18 0Z',
+    '#d64236','#fb7856',2.8);
+  shape('M13 -2 Q9 -15 5 -22',null,'#ef6749',3);
+  oval(-15,-12,5.8,6.2,'#fff0d7');
+  shape('M20 -1 Q4 -9 -16 -3 L-19 6 Q2 1 19 8Z','#ffe8cd','#fff4e6',2.5);
+  ink.restore();
+  // The ear hangs from under the hat brim and flaps on the trot and the sneeze.
+  ink.save(); ink.translate(474,418); ink.rotate(earLift); ink.translate(-474,-418);
+  shape('M470 417 Q455 417 451 440 Q447 465 459 471 Q472 476 478 453 L483 425Z','#6a3a22','#8b5232',2.5);
+  ink.restore();
+  ink.restore();
+  const marks=etch('o%x+#=:',{stride,flip:true,stepX:3.6,stepY:4.5,size:5.8,spell:false});
+  const [eyeX,eyeY]=aboutNeck(500,425,pose), [noseX,noseY]=aboutNeck(...NOSE,pose);
+  const [mouthX,mouthY]=aboutNeck(519,448,pose);
+  return {marks,pose,eye:{x:mirror(eyeX),y:eyeY,shut:pose>.1},nose:{x:mirror(noseX),y:noseY},
+    mouth:{x:mirror(mouthX),y:mouthY},art:null};
+}
+function paintDog(frame,scale) {
+  const {eye,nose,mouth,pose}=frame;
+  const art=paintMarks(frame.marks,scale,[nose]), c=art.pen;
+  // Leave a gap in the fur so the eye reads, then set the eye itself in type:
+  // open, or squeezed shut for the sneeze.
+  c.save(); c.translate(eye.x,eye.y); c.scale(HEAD,HEAD);
+  c.globalCompositeOperation='destination-out';
+  c.beginPath(); c.ellipse(0,0,5,4.6,0,0,TAU); c.fill();
+  c.globalCompositeOperation='source-over';
+  if(eye.shut) glyph(c,'>',0,0,'#fff3df',9);
+  else glyph(c,'o',0,-.8,'#fff3df',10);
+  c.restore();
+  // The smile is a ) turned on its side, cut into the fur under the snout.
+  c.save(); c.translate(mouth.x,mouth.y); c.rotate(Math.PI/2-pose); c.scale(HEAD,HEAD);
+  c.globalCompositeOperation='destination-out'; c.font='bold 10px '+mono; c.fillText(')',0,0);
+  c.restore();
+  c.save(); c.translate(nose.x,nose.y); c.rotate(-pose); c.scale(HEAD,HEAD);
+  glyph(c,'@',0,0,'#f1d2bf',12); c.restore();
+  return art;
+}
+
+const still=dogFrame(0,0), lean=dogFrame(-.04,.55);
+const trot=Array.from({length:8},(_,i)=>{
+  const swing=Math.sin(i*TAU/8);
+  return dogFrame(-.035+.026*swing,swing,.08*swing,9*swing);
+});
+const wait=[still,lean,dogFrame(-.065,1),lean,still,dogFrame(0,-.45)];
+const sniff=dogFrame(-.18,.45), recoil=dogFrame(.24,-.9,.43), recover=dogFrame(-.07,.8,-.13);
+const dogFrames=[...new Set([...trot,...wait,sniff,recoil,recover])];
+
+// ---------- Presents ----------
+// Presents under the tree: real boxes seen from a little above, so the lid and the right side
+// show, tied with a ribbon cross and a bow, and lettered with their own tags. Each is drawn in
+// the mask GIFT times larger than it appears, the bottom of its front face centred on
+// (400,400), in two pieces: the box, and the lid with its bow, which pops on landing.
+const GIFT=1.6;
+function face(points,color) {
+  ink.beginPath(); points.forEach(([x,y],i)=>i?ink.lineTo(x,y):ink.moveTo(x,y));
+  ink.closePath(); ink.fillStyle=color; ink.fill();
+}
+const gifts=[
+  {x:183,y:507,w:38,h:31,d:26,words:'TO*YOU*',box:'#4c6aa3',side:'#33497a',top:'#7d9fd6',ribbon:'#e9eef2',snow:true},
+  {x:236,y:522,w:50,h:41,d:32,words:'GIFT*FOR*YOU*',box:'#b3433a',side:'#7c2c26',top:'#de6a58',ribbon:'#ecc56c'},
+  {x:343,y:526,w:38,h:47,d:28,words:'OPEN*ME*',box:'#d8d0c0',side:'#a29a8b',top:'#f6f1e6',ribbon:'#cc4a3f'},
+  {x:290,y:537,w:36,h:29,d:24,words:'JOY*TO*ALL*',box:'#3e7d55',side:'#28543a',top:'#66ad7d',ribbon:'#e5675b',snow:true},
+  {x:392,y:534,w:30,h:25,d:20,words:'XOXO*',box:'#c4943f',side:'#8c6828',top:'#e9c068',ribbon:'#4c9a68'},
+].map(g=>{
+  const w=g.w*GIFT, h=g.h*GIFT, d=g.d*GIFT, dx=d*.42, dy=d*.34;
+  const lid=Math.max(7,h*.2), band=Math.max(6,w*.15), half=band/(2*d), o=2.5;
+  const L=400-w/2, R=400+w/2, T=400-h, mid=(k,x,y)=>[x+dx*k,y-dy*k];
+  // The box: front and right side below the lid, the ribbon running down both.
+  face([[L,T+lid],[R,T+lid],[R,400],[L,400]],g.box);
+  face([[R,T+lid],mid(1,R,T+lid),mid(1,R,400),[R,400]],g.side);
+  rect(400-band/2,T+lid,band,h-lid,g.ribbon);
+  face([mid(.5-half,R,T+lid),mid(.5+half,R,T+lid),mid(.5+half,R,400),mid(.5-half,R,400)],g.ribbon);
+  rect(L,T+lid,w,2.2,g.side);
+  const body=etch(g.words);
+  // The lid: a lighter top, a slight overhang, the ribbon crossing over it, and the bow.
+  face([[L-o,T],[R+o,T],mid(1,R+o,T),mid(1,L-o,T)],g.top);
+  face([[L-o,T],[R+o,T],[R+o,T+lid],[L-o,T+lid]],g.box);
+  face([[R+o,T],mid(1,R+o,T),mid(1,R+o,T+lid),[R+o,T+lid]],g.side);
+  rect(400-band/2,T,band,lid,g.ribbon);
+  face([[400-band/2,T],[400+band/2,T],mid(1,400+band/2,T),mid(1,400-band/2,T)],g.ribbon);
+  face([mid(.5-half,L-o,T),mid(.5-half,R+o,T),mid(.5+half,R+o,T),mid(.5+half,L-o,T)],g.ribbon);
+  face([mid(.5-half,R+o,T),mid(.5+half,R+o,T),mid(.5+half,R+o,T+lid),mid(.5-half,R+o,T+lid)],g.ribbon);
+  if(g.snow) { ink.fillStyle='#eef3f5'; ink.beginPath(); ink.ellipse(L+w*.26+dx*.5,T-dy*.5,w*.15,dy*.32+1.5,0,0,TAU); ink.fill(); }
+  const [bx,by]=mid(.5,400,T), bow=Math.max(1.3,w/52);
+  ink.fillStyle=g.ribbon;
+  for(const s of [-1,1]) {
+    ink.beginPath(); ink.ellipse(bx+s*9*bow,by-5*bow,10*bow,6.5*bow,s*.45,0,TAU); ink.fill();
+    face([[bx,by],[bx+s*7*bow,by+9*bow],[bx+s*11*bow,by+7*bow]],g.ribbon);
+  }
+  oval(bx,by-2.5*bow,4.8*bow,4.8*bow,g.ribbon);
+  ink.globalAlpha=.4; oval(bx,by-2.5*bow,4.8*bow,4.8*bow,'#fff'); ink.globalAlpha=1;
+  const cap=etch(g.words);
+  return {...g,body,cap,hinge:[400,T+lid],art:null,lidArt:null};
+}).sort((a,b)=>a.y-b.y);
+// They arrive from left to right once the lights are on.
+[...gifts].sort((a,b)=>a.x-b.x).forEach((g,rank)=>g.rank=rank);
+
+// ---------- The tree ----------
+// Project the turning boughs into a depth-tested character grid.
+const width=800,height=640,cellX=3.7,cellY=5.5;
+const cols=Math.ceil(width/cellX), rows=Math.ceil(height/cellY);
+const depths=new Float32Array(cols*rows), tones=new Int8Array(cols*rows);
+const treeX=343, foot=495, crown=82, treeHeight=foot-crown;
+const levels=8, sectors=66, bands=8;
+// How far each tier's boughs reach, from the bottom skirt (up=0) to the tip (up=1).
+const tierSpread=up=>147-127*up;
+const vertices=[],faces=[];
+for(let level=0;level<levels;level++) {
+  const base=vertices.length, up=level/(levels-1);
+  const hem=foot-20-335*up;
+  const tierHeight=123-64*up;
+  const spread=tierSpread(up);
+  for(let row=0;row<=bands;row++) {
+    const r=.008+.992*row/bands;
+    for(let col=0;col<sectors;col++) {
+      const angle=col*TAU/sectors;
+      const lobe=.5+.5*Math.cos(angle*(13-level)+level*1.9);
+      const fringe=r*r*r;
+      const radius=spread*r*(.94+fringe*(lobe*.11+.025*Math.sin(angle*5)));
+      const y=hem-tierHeight+tierHeight*Math.pow(r,.83)+fringe*(lobe*10-4);
+      vertices.push({x:radius*Math.sin(angle),z:radius*Math.cos(angle),y,azimuth:angle,
+        nx:Math.sin(angle),nz:Math.cos(angle),edge:r,vein:lobe,ring:spread*r});
+      if(row===bands) continue;
+      // Each face carries its corners' azimuths, unwrapped so the seam face runs on to 2π.
+      // The lettering is laid out along the boughs from them, so the words turn with the tree.
+      const a=base+row*sectors+col,b=base+row*sectors+(col+1)%sectors;
+      const from=col*TAU/sectors, to=(col+1)*TAU/sectors;
+      faces.push([a,b,a+sectors,from,to,from],[b,b+sectors,a+sectors,to,to,from]);
+    }
+  }
+}
+const px=new Float32Array(vertices.length), py=new Float32Array(vertices.length);
+const pz=new Float32Array(vertices.length), value=new Float32Array(vertices.length);
+const ringR=Float32Array.from(vertices,v=>v.ring);
+const texAngle=new Float32Array(cols*rows), texRing=new Float32Array(cols*rows);
+const pine=['#11291f','#183b2d','#20503a','#276444','#327c54','#479561','#6dac7c','#9bc5a0'];
+// The tree is lettered with carols and greetings: capitals where the light catches the
+// boughs, lower case in the shade.
+const treeWords='MERRY*CHRISTMAS*JOY*NOEL*PEACE*ON*EARTH*DECK*THE*HALLS*FA*LA*LA*SILENT*NIGHT*HOLLY*JINGLE*BELLS*EVERGREEN*GOOD*TIDINGS*';
+const treeGlyphs=[...new Set(treeWords+treeWords.toLowerCase())];
+const upperMark=[...treeWords].map(ch=>treeGlyphs.indexOf(ch));
+const lowerMark=[...treeWords.toLowerCase()].map(ch=>treeGlyphs.indexOf(ch));
+// Cache glyphs so a frame needs one image stamp per occupied cell.
+// The atlas is redrawn at the canvas's pixel density whenever that changes.
+const tile=16;
+let atlas=null, atlasTile=tile;
+function paintAtlas(scale) {
+  atlasTile=Math.ceil(tile*scale);
+  atlas=document.createElement('canvas');
+  atlas.width=treeGlyphs.length*atlasTile; atlas.height=pine.length*atlasTile;
+  const pen=atlas.getContext('2d');
+  pen.setTransform(atlasTile/tile,0,0,atlasTile/tile,0,0);
+  pen.textAlign='center'; pen.textBaseline='middle';
+  for(let shade=0;shade<pine.length;shade++) treeGlyphs.forEach((mark,k)=>
+    glyph(pen,mark,k*tile+8,shade*tile+8,pine[shade],6.4));
+}
+function leafTriangle(a,b,c,ta,tb,tc) {
+  const x=px[a],y=py[a], bx=px[b]-x,by=py[b]-y,cx=px[c]-x,cy=py[c]-y;
+  const det=bx*cy-by*cx;
+  if(Math.abs(det)<.001) return;
+  const left=Math.max(0,Math.ceil(Math.min(x,px[b],px[c]))),right=Math.min(cols-1,Math.floor(Math.max(x,px[b],px[c])));
+  const top=Math.max(0,Math.ceil(Math.min(y,py[b],py[c]))),bottom=Math.min(rows-1,Math.floor(Math.max(y,py[b],py[c])));
+  for(let row=top;row<=bottom;row++) for(let col=left;col<=right;col++) {
+    const u=((col-x)*cy-(row-y)*cx)/det, v=(bx*(row-y)-by*(col-x))/det;
+    if(u<0||v<0||u+v>1) continue;
+    const i=row*cols+col, z=pz[a]+u*(pz[b]-pz[a])+v*(pz[c]-pz[a]);
+    if(z<=depths[i]) continue;
+    depths[i]=z;
+    tones[i]=Math.min(7,Math.max(0,Math.floor(value[a]+u*(value[b]-value[a])+v*(value[c]-value[a]))));
+    texAngle[i]=ta+u*(tb-ta)+v*(tc-ta);
+    texRing[i]=ringR[a]+u*(ringR[b]-ringR[a])+v*(ringR[c]-ringR[a]);
+  }
+}
+// A continuous strand leads the reveal. Branches open around it in the same winding order.
+const turns=3.4;
+const emerging=new Uint8Array(vertices.length);
+function coilRadius(u) { return 145*Math.pow(1-u,.83)+2; }
+// The strand spells out the old carol as it winds up, one letter every third point.
+const strandWords='O*CHRISTMAS*TREE*HOW*LOVELY*ARE*THY*BRANCHES*';
+const strand=Array.from({length:940},(_,i)=>{
+  const u=i/939, a=TAU*turns*u;
+  return {u,a,r:coilRadius(u),offset:hash(i,91),letter:i%3?null:strandWords[(i/3)%strandWords.length]};
+}).filter(p=>p.letter);
+function drawStrand(growth,angle,front) {
+  if(growth<=0||growth>=1) return;
+  const tip=clamp(growth/.75);
+  for(const p of strand) {
+    if(p.u>tip) break;
+    const a=p.a+angle, depth=Math.cos(a);
+    if((depth>=0)!==front) continue;
+    const life=growth-p.u*.75;
+    const alpha=smooth(life/.014)*(1-smooth((life-.20)/.24))*(1-smooth((growth-.92)/.08));
+    if(alpha<.015) continue;
+    const r=p.r+(p.offset-.5)*2.5;
+    const x=treeX+Math.sin(a)*r, y=foot-9-p.u*(treeHeight-11)+depth*r*.14;
+    ctx.globalAlpha=alpha*(front?.92:.6);
+    glyph(ctx,p.letter,x,y,life<.05?'#eef0c8':'#97c69e',8);
+  }
+  ctx.globalAlpha=1;
+}
+function drawPine(growth,angle,t,lit) {
+  if(growth<=0) return;
+  tones.fill(-1); depths.fill(-Infinity);
+  const finished=growth>=1, shaking=t>sneeze&&t<sneeze+2000;
+  let sin=Math.sin(angle),cos=Math.cos(angle);
+  for(let i=0;i<vertices.length;i++) {
+    const v=vertices[i], h=clamp((foot-v.y)/treeHeight);
+    if(shaking) { const a=angle+sway(t,v.y); sin=Math.sin(a); cos=Math.cos(a); }
+    const phase=v.azimuth-h*TAU*turns;
+    const delay=h*.73+.065+.065*(1-Math.cos(phase))*.5;
+    const g=finished?1:smooth((growth-delay)/.14);
+    emerging[i]=g>0?1:0;
+    if(!emerging[i]) continue;
+    const curl=(1-g)*1.45, cs=Math.cos(curl), sn=Math.sin(curl);
+    const localX=v.x*cs-v.z*sn, localZ=v.z*cs+v.x*sn;
+    const radius=.46+.54*g;
+    const x=(localX*cos+localZ*sin)*radius,z=(localZ*cos-localX*sin)*radius;
+    const nx=v.nx*cos+v.nz*sin,nz=v.nz*cos-v.nx*sin;
+    const y=v.y+(1-g)*(10+24*v.edge);
+    px[i]=(treeX+x)/cellX; py[i]=(y+z*.135)/cellY;
+    pz[i]=z+(foot-y)*.135;
+    const light=.46-.27*nx+.15*nz+.10*v.vein;
+    value[i]=.1+5.8*light+1.2*Math.pow(v.edge,5)-.85*(1-v.edge);
+  }
+  for(const [a,b,c,ta,tb,tc] of faces)
+    if(emerging[a]&&emerging[b]&&emerging[c]) leafTriangle(a,b,c,ta,tb,tc);
+  placeBaubles(t,angle,lit);
+  ctx.globalAlpha=smooth(growth/.11);
+  const n=treeWords.length, glass=[];
+  for(let i=0;i<tones.length;i++) {
+    if(ballGlass[i]>=0) { glass.push(i); continue; }
+    const shade=tones[i];
+    if(shade<0) continue;
+    // One letter per cell of arc length around the bough; each screen row starts the
+    // phrase somewhere new so the lines don't stack into columns.
+    const row=Math.floor(i/cols);
+    const k=(Math.floor(texAngle[i]*texRing[i]/cellX)+row*7)%n;
+    const mark=shade>=4?upperMark[k]:lowerMark[k];
+    ctx.drawImage(atlas,mark*atlasTile,shade*atlasTile,atlasTile,atlasTile,
+      (i%cols)*cellX-8,row*cellY-8,tile,tile);
+  }
+  drawGlass(glass,t);
+  ctx.globalAlpha=1;
+}
+// Follow the actual skirts rather than hanging lamps on an imaginary straight cone.
+function skirt(y) {
+  let radius=0;
+  for(let l=0;l<levels;l++) {
+    const up=l/(levels-1),hem=foot-20-335*up,h=123-64*up;
+    const r=(y-hem+h)/h;
+    if(r>0&&r<=1.035) radius=Math.max(radius,tierSpread(up)*Math.pow(r,1/.83));
+  }
+  return radius;
+}
+// ---------- Ornaments, lights and the star ----------
+// A handful of glass baubles hang just under the bough tips, mostly on the lower tiers. They are
+// set into the tree's own character grid and depth-tested against it, so branches in front tuck
+// over them, and they are shaded like the boughs: bright where they face the light, dim round
+// the far side, with a white glint.
+const baubleGlass=[
+  ['#3c0a0e','#6a1418','#9c1f24','#c8302f','#e0544a','#f0806c','#fbb09a','#ffe0d4'],
+  ['#3a2606','#64440c','#8f6514','#bb8a1f','#d9aa35','#ecc75e','#f8e294','#fff6d6'],
+  ['#0b1540','#132467','#1d3992','#2f56c2','#4f7be0','#7fa3f0','#b5ccfa','#e8f0ff'],
+  ['#24282e','#3d434b','#5c636c','#80888f','#a4acb4','#c4cbd2','#e2e7ec','#ffffff'],
+  ['#3d0b25','#661440','#922060','#bd3583','#da5ba1','#ec8abe','#f8b9da','#ffe6f2'],
+];
+const glassRamp=['.',':','o','o','O','0','@','@'];
+const ballGlass=new Int8Array(cols*rows).fill(-1), ballLevel=new Int8Array(cols*rows);
+const baubles=Array.from({length:18},(_,i)=>{
+  const tier=Math.min(6,Math.floor(Math.pow(hash(i,520),1.5)*7)), up=tier/(levels-1);
+  const hem=foot-20-335*up, h=123-64*up, y=hem-h*(.05+.2*hash(i,521)), tone=hash(i,501);
+  return {y,u:clamp((foot-y)/treeHeight),az:i*2.39996+hash(i,502)*.9,r:skirt(y)*.97,
+    R:8.5+3*(1-tier/6),phase:hash(i,503)*TAU,on:0,glint:-1,
+    glass:tone<.42?0:tone<.68?1:tone<.82?2:tone<.92?3:4};
+});
+function placeBaubles(t,angle,lit) {
+  ballGlass.fill(-1);
+  if(lit<=0) return;
+  baubles.forEach((b,n)=>{
+    b.on=smooth((lit-.2*b.u-.1)/.4); b.glint=-1;
+    if(b.on<.02) return;
+    const A=b.az+angle+sway(t,b.y), front=Math.cos(A);
+    if(front<-.2) return;
+    const knock=jolt(t,treeX+Math.sin(A)*b.r,b.y);
+    const swing=.4*Math.sin(t*.0017+b.phase)+3*knock*Math.sin((t-sneeze)/45);
+    const x=treeX+Math.sin(A)*b.r+swing, z=front*b.r, y=b.y+b.R*.5;
+    const cx=x/cellX, cy=(y+z*.135)/cellY, cz=z+(foot-y)*.135, rx=b.R/cellX, ry=b.R/cellY;
+    const facing=.55+.45*clamp(.5+.5*(.9*front-.45*Math.sin(A)));
+    for(let row=Math.ceil(cy-ry);row<=Math.floor(cy+ry);row++)
+      for(let col=Math.ceil(cx-rx);col<=Math.floor(cx+rx);col++) {
+        if(row<0||row>=rows||col<0||col>=cols) continue;
+        const dx=(col-cx)/rx, dy=(row-cy)/ry, d2=dx*dx+dy*dy;
+        if(d2>1.05) continue;
+        const i=row*cols+col, nz=Math.sqrt(Math.max(0,1-d2)), depth=cz+b.R*nz;
+        if(depth<=depths[i]) continue;
+        depths[i]=depth; ballGlass[i]=n;
+        const diffuse=Math.max(0,-.45*dx-.55*dy+.7*nz);
+        const glint=Math.pow(Math.max(0,-.32*dx-.44*dy+.84*nz),24);
+        if(glint>.55&&b.glint<0) { ballLevel[i]=8; b.glint=i; }
+        else ballLevel[i]=Math.max(0,Math.min(7,Math.round((.12+.88*diffuse)*facing*7.4-(d2>.7?1:0))));
+      }
+    // The cap sits on top, unless a bough hides it.
+    const row=Math.round(cy-ry-.55), col=Math.round(cx);
+    if(row>=0&&row<rows&&col>=0&&col<cols) {
+      const i=row*cols+col, depth=cz+b.R*.3;
+      if(depth>depths[i]) { depths[i]=depth; ballGlass[i]=n; ballLevel[i]=9; }
+    }
+  });
+}
+function drawGlass(cells,t) {
+  const base=ctx.globalAlpha;
+  ctx.font='bold 7px '+mono;
+  for(const i of cells) {
+    const b=baubles[ballGlass[i]], level=ballLevel[i];
+    ctx.globalAlpha=base*b.on;
+    ctx.fillStyle=level===8?'#ffffff':level===9?'#d9b35a':baubleGlass[b.glass][level];
+    ctx.fillText(level===8?'*':level===9?'=':glassRamp[level],(i%cols)*cellX,Math.floor(i/cols)*cellY);
+  }
+  // Now and then a bauble's glint flares.
+  for(const b of baubles) {
+    if(b.glint<0) continue;
+    const flare=Math.pow(Math.max(0,Math.sin(t*.0012+b.phase*4)),40);
+    if(flare<.1) continue;
+    ctx.globalAlpha=base*b.on*flare; ctx.shadowColor='#ffffff'; ctx.shadowBlur=5;
+    glyph(ctx,'+',(b.glint%cols)*cellX,Math.floor(b.glint/cols)*cellY,'#ffffff',4+4*flare);
+    ctx.shadowBlur=0;
+  }
+  ctx.globalAlpha=base;
+}
+// Fairy lights: two strings wound round and round the tree, sagging between the boughs they
+// hang from. Each bulb breathes on its own, and every so often one flares into a sparkle.
+const fairy=[];
+for(let s=0;s<2;s++) for(let i=0;i<140;i++) {
+  const u=(i+.5)/140, y=foot-22-u*(treeHeight-46), sag=2.4*Math.sin(((i%8)+.5)/8*Math.PI);
+  fairy.push({u,y:y+sag,r:skirt(y)*.96+1.5,az:u*TAU*6.5+s*Math.PI,
+    phase:hash(i,410+s)*TAU,speed:.7+.8*hash(i,420+s),gold:hash(i,430+s)<.28});
+}
+function drawFairyLights(t,angle,lit) {
+  for(const f of fairy) {
+    const a=f.az+angle+sway(t,f.y), front=Math.cos(a);
+    if(front<.04) continue;
+    let on=smooth((lit-.2*f.u)/.48)*smooth((front-.04)/.28);
+    if(on<.01) continue;
+    const x=treeX+Math.sin(a)*f.r, y=f.y+front*f.r*.135;
+    // Bulbs tucked behind a bough stay hidden.
+    const col=Math.round(x/cellX), row=Math.round(y/cellY);
+    if(col>=0&&col<cols&&row>=0&&row<rows&&depths[row*cols+col]>front*f.r+(foot-f.y)*.135+2.5) continue;
+    // When the sneeze's jolt reaches a bulb, it stutters.
+    const shake=jolt(t,x,y);
+    if(shake>.04 && hash(Math.floor(t/60),f.phase)<.6) on*=1-.85*Math.min(1,shake*1.5);
+    const breathe=.5+.5*Math.sin(t*.0026*f.speed+f.phase), color=f.gold?'#ffc75a':'#fff0c8';
+    ctx.globalAlpha=on*(.45+.55*breathe);
+    if(breathe>.78) glyph(ctx,'*',x,y+1,color,7);
+    else glyph(ctx,'.',x,y-2.2,color,8);
+    const flare=Math.pow(Math.max(0,Math.sin(t*.00093*f.speed+f.phase*5.3)),120);
+    if(flare>.08) {
+      const reach=5+2.5*flare;
+      ctx.globalAlpha=on*Math.min(1,flare*1.4);
+      ctx.shadowColor=color; ctx.shadowBlur=6;
+      glyph(ctx,'+',x,y,'#ffffff',7+5*flare); ctx.shadowBlur=0;
+      glyph(ctx,'-',x-reach,y,color,6); glyph(ctx,'-',x+reach,y,color,6);
+      glyph(ctx,'|',x,y-reach,color,5); glyph(ctx,'|',x,y+reach,color,5);
+    }
+  }
+  ctx.globalAlpha=1;
+}
+// The sneeze lands in the low boughs; the jolt climbs the tree from there and makes it sway.
+const impactX=440, impactY=442;
+function jolt(t,x,y) {
+  const s=t-sneeze-90-Math.hypot(x-impactX,y-impactY)*1.6;
+  return s<0||s>900?0:Math.exp(-s/210);
+}
+function sway(t,y) {
+  const s=t-sneeze-90-Math.abs(y-impactY)*1.3;
+  if(s<0||s>1300) return 0;
+  return .05*(1-.55*clamp((foot-y)/treeHeight))*Math.sin(s/37)*Math.exp(-s/230);
+}
+// The star on top spells its own name.
+function star(x,y,alpha) {
+  ctx.globalAlpha=alpha;
+  const points=[];
+  for(let i=0;i<10;i++) {
+    const a=i*Math.PI/5-Math.PI/2,r=i%2?7:17;
+    points.push([Math.cos(a)*r,Math.sin(a)*r]);
+  }
+  let k=0;
+  for(let dy=-17;dy<17;dy+=2.8) for(let dx=-17;dx<17;dx+=2.5) {
+    let inside=false;
+    for(let i=0,j=9;i<10;j=i++) {
+      const [ax,ay]=points[i],[bx,by]=points[j];
+      if((ay>dy)!==(by>dy)&&dx<(bx-ax)*(dy-ay)/(by-ay)+ax) inside=!inside;
+    }
+    if(inside) glyph(ctx,'STAR'[k++%4],x+dx,y+dy,dx<0?'#ffe5a3':'#d6a14f',4.4);
+  }
+  ctx.globalAlpha=1;
+}
+function lightTree(t,angle,lit) {
+  if(lit<=0) return;
+  drawFairyLights(t,angle,lit);
+  const knock=jolt(t,treeX,crown);
+  star(treeX+2.6*knock*Math.sin((t-sneeze)/34),crown-13,smooth((lit-.56)/.44)*(1-.45*knock));
+  ctx.globalAlpha=1;
+}
+// ---------- The story: the dog, the presents, the sneeze ----------
+const dogScale=.65, dogBaseline=510;
+function drawDog(t) {
+  if(t<enter) return;
+  const p=clamp((t-enter)/(arrived-enter)),step=Math.floor((t-enter)/103)%8;
+  const late=(t-sneeze)/1000,inhale=t>contact-195&&t<sneeze;
+  const waiting=Math.floor(Math.max(0,t-arrived)/165)%6;
+  const pose=p<1?trot[step]:inhale?sniff:late>=0&&late<.16?recoil:late>=.16&&late<.40?recover:wait[waiting];
+  const approach=1-Math.pow(1-p,1.65);
+  const x=694-161*approach;
+  const hop=p<1?Math.abs(Math.sin((t-enter)/103*Math.PI/4))*3*(1-smooth((p-.82)/.18)):
+    late>=0&&late<.4?6*Math.sin(late/.4*Math.PI):0;
+  ctx.save();
+  ctx.globalAlpha=smooth(p/.20);
+  ctx.translate(x,dogBaseline-hop);ctx.scale(dogScale,dogScale);ctx.translate(-395,-527);
+  const art=pose.art;
+  ctx.drawImage(art.canvas,art.x,art.y,art.w,art.h);ctx.restore();
+  if(t>sneeze) drawShakeoff(t,x,hop,pose.pose);
+  if(t<arrived+220 || t>sneeze+1250) return;
+  // The flake comes to rest just above the nose, wherever the head happens to be.
+  const [tipX,tipY]=aboutNeck(NOSE[0],NOSE[1]-7,pose.pose);
+  const noseX=x-dogScale*(tipX-395), noseY=dogBaseline+dogScale*(tipY-527);
+  if(t<sneeze) {
+    const fall=clamp((t-arrived-220)/(contact-arrived-220)),rest=1-fall;
+    ctx.globalAlpha=smooth(fall/.14);
+    const x=noseX-rest*(17+22*Math.sin(fall*TAU*1.35)), y=noseY-144*rest;
+    ctx.shadowColor='#eac489'; ctx.shadowBlur=3;
+    glyph(ctx,'*',x,y,'#fff2cc',17); ctx.shadowBlur=0;
+  } else {
+    const [sneezeX,sneezeY]=aboutNeck(...NOSE,0);
+    const originX=x-dogScale*(sneezeX-395),originY=dogBaseline+dogScale*(sneezeY-527);
+    for(let i=0;i<24;i++) {
+      const theta=(hash(i,72)-.5)*2.35, travel=(1-Math.exp(-late*3))*(13+hash(i,81)*58);
+      ctx.globalAlpha=1-smooth((late-.10)/1.1);
+      glyph(ctx,i%6?'.':'*',originX-travel*Math.cos(theta),originY-8+travel*Math.sin(theta)+late*late*17,'#dce2db',i%6?8:10);
+    }
+  }
+  ctx.globalAlpha=1;
+}
+// The presents arrive like an old cartoon. A twinkle opens in the air, each box drops out of it
+// stretching as it falls, lands squashed flat, bounces up tall, wobbles and settles, while its
+// lid pops up and claps back down in a puff of sparkles. When the dog sneezes, they jump.
+const giftDrop=.34, giftFall=82;
+function sparkle(x,y,size,alpha,color) {
+  if(alpha<.01) return;
+  ctx.globalAlpha=alpha; ctx.shadowColor=color; ctx.shadowBlur=6;
+  glyph(ctx,'+',x,y,'#ffffff',size); ctx.shadowBlur=0;
+  const reach=size*.62;
+  glyph(ctx,'-',x-reach,y,color,size*.6); glyph(ctx,'-',x+reach,y,color,size*.6);
+  glyph(ctx,'|',x,y-reach,color,size*.5); glyph(ctx,'|',x,y+reach,color,size*.5);
+}
+function drawGifts(t) {
+  for(const g of gifts) {
+    const s=(t-(lightsReady-560+g.rank*210))/1000;
+    if(s<-.3) continue;
+    const top=g.y-g.h-giftFall;
+    if(s<0) { const k=(s+.3)/.3; sparkle(g.x,top,5+11*Math.sin(Math.PI*k),Math.sin(Math.PI*k),'#ffd36e'); continue; }
+    let y=0, sx=1, sy=1, rot=0, lid=0, lidRot=0;
+    const side=g.rank%2?1:-1;
+    if(s<giftDrop) {
+      const f=s/giftDrop;
+      y=-giftFall*(1-f*f); sy=1+.3*f; sx=1-.13*f;
+      if(f<.35) sparkle(g.x,top,16*(1-f/.35),1-f/.35,'#ffd36e');
+    } else {
+      const u=s-giftDrop, spring=Math.exp(-u/.12)*Math.cos(u*21);
+      sy=1-.36*spring; sx=1+.28*spring;
+      y=-11*Math.max(0,Math.sin(Math.PI*clamp((u-.07)/.26)));
+      rot=.1*Math.exp(-u/.3)*Math.sin(u*17)*side;
+      lid=-15*Math.max(0,Math.sin(Math.PI*clamp(u/.34)))-4*Math.max(0,Math.sin(Math.PI*clamp((u-.34)/.14)));
+      lidRot=.28*Math.sin(Math.PI*clamp(u/.34))*-side;
+      // A puff of sparkles kicks out from under the box.
+      if(u<.75) for(let i=0;i<8;i++) {
+        const a=Math.PI+(i+.5)/8*Math.PI, out=(1-Math.exp(-u*6))*(6+10*hash(i,g.rank+600));
+        ctx.globalAlpha=1-smooth(u/.75);
+        glyph(ctx,i%3?'*':'+',g.x+Math.cos(a)*(g.w*.42+out),g.y-3+Math.sin(a)*out*.7-u*7,
+          i%2?'#fff3c4':'#ffcf5e',6+2*hash(i,g.rank+610));
+      }
+    }
+    // Startled by the sneeze: a hop, a stretch, and the lid jumps.
+    const jump=(t-sneeze-140-Math.abs(g.x-impactX)*1.4)/1000;
+    if(jump>0&&jump<.9) {
+      const hop=Math.max(0,Math.sin(Math.PI*clamp(jump/.3)));
+      y-=8*hop; sy*=1+.14*hop-.1*Math.exp(-jump/.08)*(jump<.05?1:0); sx*=1-.08*hop;
+      lid-=7*Math.max(0,Math.sin(Math.PI*clamp(jump/.28)));
+      rot+=.06*Math.exp(-jump/.25)*Math.sin(jump*20)*side;
+    }
+    ctx.save(); ctx.globalAlpha=1;
+    ctx.translate(g.x,g.y+y); ctx.rotate(rot); ctx.scale(sx/GIFT,sy/GIFT); ctx.translate(-400,-400);
+    const body=g.art; ctx.drawImage(body.canvas,body.x,body.y,body.w,body.h);
+    const [hx,hy]=g.hinge;
+    ctx.translate(hx,hy+lid*GIFT); ctx.rotate(lidRot); ctx.translate(-hx,-hy);
+    const cap=g.lidArt; ctx.drawImage(cap.canvas,cap.x,cap.y,cap.w,cap.h);
+    ctx.restore();
+  }
+  ctx.globalAlpha=1;
+}
+// Snow the sneeze knocks loose. Most of it sifts down off the boughs; a little lands on the hat.
+// Where knocked-off snow settles: along the hat's crown, its brim, and on the pom.
+const hatTop=[[4.8,-32.5],[1,-35.5],[-6,-35],[-12.4,-30.5],[-2.5,-8],[-15,-19]].map(([x,y])=>onHat(x,y));
+const shakeoff=Array.from({length:34},(_,i)=>{
+  const toHat=i<hatTop.length;
+  const y=toHat?375+hash(i,203)*7:360+hash(i,201)*100;
+  const x=treeX+skirt(y)*(toHat?.97:.62+.36*hash(i,202));
+  return {toHat,x,y,spot:hatTop[i],
+    delay:90+Math.hypot(x-impactX,y-impactY)*1.6+(toHat?70+i*45:hash(i,204)*260),
+    drift:3+hash(i,205)*18,wobble:hash(i,208)*TAU,
+    ch:i%4===1?'*':'.',size:toHat?9:6+hash(i,206)*4,rest:507+hash(i,207)*15};
+});
+function drawShakeoff(t,dogX,hop,pose) {
+  const fall=130, flight=.6;
+  for(const f of shakeoff) {
+    const s=(t-sneeze-f.delay)/1000;
+    if(s<0) continue;
+    let x,y,alpha=smooth(s/.06);
+    if(f.toHat) {
+      // Track the hat as the head bobs, so settled snow rides along with it.
+      const [hx,hy]=aboutNeck(f.spot[0],f.spot[1],pose);
+      const tx=dogX-dogScale*(hx-395), ty=dogBaseline-hop+dogScale*(hy-527)-(f.ch==='.'?3:0);
+      const k=Math.min(1,s/flight);
+      x=f.x+(tx-f.x)*k; y=f.y+(ty-f.y)*k*k;
+    } else {
+      const landed=Math.sqrt((f.rest-f.y)/fall);
+      const u=Math.min(s,landed);
+      x=f.x+f.drift*(1-Math.exp(-u*2.4))+1.6*Math.sin(u*8+f.wobble);
+      y=f.y+fall*u*u;
+      alpha*=1-smooth((s-landed)/.7);
+      if(alpha<.01) continue;
+    }
+    ctx.globalAlpha=alpha*.92;
+    glyph(ctx,f.ch,x,y,'#e6f0f1',f.size);
+  }
+  ctx.globalAlpha=1;
+}
+// ---------- Snow ----------
+// The snowfield, precomputed at the canvas's pixel density: rows of drifts receding to the
+// horizon, finer and dimmer with distance. Each cell is shaded by the slope of the drift under
+// it, lit from the upper left: soft and pale on the faces turned to the light, sinking to bare
+// dark in the hollows and in the tree's shadow, and warmed a little near the lights.
+const groundLeft=-140, groundWidth=1080, groundTop=486, groundSpan=104;
+// Low, flat marks read as a surface receding away; tall ones (:) would read as rain.
+const snowRamp=[' ','.','.','-','-','~','~','='];
+const snowShade=[[22,30,42],[38,51,66],[56,73,92],[77,97,118],[101,122,143],[130,151,170],[166,186,201],[208,223,232]];
+const warmLight=[242,194,124];
+const glintSpots=[];
+let ground=null;
+function driftHeight(x,d) {
+  return 3.2*Math.sin(x/58+d*6.3)+2*Math.sin(x/21-d*11.7+1.1)+1.1*Math.sin(x/7.3+d*31)
+    +7*Math.exp(-Math.pow((x-treeX)/95,2))*(1-d);
+}
+function paintGround(scale) {
+  ground=document.createElement('canvas');
+  ground.width=Math.ceil(groundWidth*scale); ground.height=Math.ceil(groundSpan*scale);
+  const pen=ground.getContext('2d');
+  pen.setTransform(scale,0,0,scale,-groundLeft*scale,-groundTop*scale);
+  pen.textAlign='center'; pen.textBaseline='middle';
+  glintSpots.length=0;
+  for(let y=499,row=0;y<584;row++) {
+    const d=clamp((y-499)/80), size=4.2+4.3*d, stepX=size*.6;
+    for(let x=groundLeft+(row*1.7)%stepX,k=0;x<groundLeft+groundWidth;x+=stepX,k++) {
+      const jx=x+(hash(k,row+740)-.5)*stepX*.5, h=driftHeight(jx,d);
+      const slope=(driftHeight(jx+2,d)-driftHeight(jx-2,d))/4;
+      let light=.5+.55*slope+.04*h+.1*Math.sin(jx/140+d*3)+.14*(hash(k,row+700)-.5);
+      light*=(.62+.38*d)*(1-.5*Math.exp(-Math.pow((jx-treeX)/150,2)-Math.pow((y-505)/13,2)));
+      const level=Math.max(0,Math.min(7,Math.floor(light*8)));
+      if(!level) continue;
+      const warm=.24*Math.exp(-Math.pow((jx-treeX)/170,2)-Math.pow((y-506)/28,2));
+      const [r,g,b]=snowShade[level].map((v,i)=>Math.round(v+(warmLight[i]-v)*warm));
+      const edge=clamp((jx-groundLeft)/140)*clamp((groundLeft+groundWidth-jx)/140);
+      pen.globalAlpha=edge*smooth(d/.12)*(1-smooth((y-570)/14))*(.5+.5*d);
+      const gy=y-h*.4*(1-.3*d)+(hash(k,row+750)-.5)*1.2;
+      glyph(pen,snowRamp[level],jx,gy-(level<3?size*.25:0),'rgb('+r+','+g+','+b+')',size);
+      if(level>=4&&hash(k,row+710)<.05) glintSpots.push({x:jx,y:gy,size,phase:hash(k,row+720)*TAU,speed:.6+.9*hash(k,row+730)});
+    }
+    y+=(4.2+4.3*d)*.74;
+  }
+}
+// Sunlit crystals in the snowfield wink on and off.
+function snowGlints(t) {
+  const shown=smooth(t/900);
+  for(const g of glintSpots) {
+    const shine=Math.pow(Math.max(0,Math.cos(t*.0019*g.speed+g.phase)),26);
+    if(shine<.06) continue;
+    ctx.globalAlpha=shine*.9*shown;
+    glyph(ctx,shine>.55?'+':'*',g.x,g.y+(shine>.55?0:g.size*.12),'#f2fbff',g.size*(.75+.6*shine));
+  }
+  ctx.globalAlpha=1;
+}
+// Falling snow in depth: a far haze of tiny flakes, a middle layer, near flakes that tumble as
+// they fall, and a few big soft ones drifting right past the lens. A slow wind sways them all,
+// the nearer ones more. Flakes span past the scene's edges so wide screens snow to the borders.
+function snowLayer(count,seed,{size,speed,alpha,chars,color,bottom,sway,spin=false,blur=0}) {
+  return Array.from({length:count},(_,i)=>({
+    x:-120+hash(i,seed)*1040, start:hash(i,seed+1), drift:hash(i,seed+2)*TAU,
+    speed:speed[0]+(speed[1]-speed[0])*hash(i,seed+3), size:Math.round((size[0]+(size[1]-size[0])*hash(i,seed+4))*2)/2,
+    ch:chars[Math.floor(hash(i,seed+5)*chars.length)], spin:spin?(hash(i,seed+6)-.5)*3:0,
+    alpha:alpha*(.7+.3*hash(i,seed+7)), color, bottom, sway, blur})).sort((a,b)=>a.size-b.size);
+}
+const farSnow=snowLayer(300,32,{size:[4.5,6.5],speed:[.22,.38],alpha:.42,chars:'..:',color:'#7f99a6',bottom:505,sway:5});
+const midSnow=snowLayer(150,110,{size:[7.5,11],speed:[.42,.62],alpha:.62,chars:'..*+',color:'#b3cad3',bottom:548,sway:10});
+const nearSnow=snowLayer(48,140,{size:[13,19],speed:[.7,1],alpha:.85,chars:'**+',color:'#e2eef2',bottom:600,sway:18,spin:true});
+const lensSnow=snowLayer(5,170,{size:[32,46],speed:[1.1,1.4],alpha:.13,chars:'*',color:'#dbe9ee',bottom:640,sway:26,spin:true,blur:6});
+// Flakes keep their pace however long the loop runs.
+const snowPeriod=19270;
+const wind=t=>.6*Math.sin(t*.00031)+.4*Math.sin(t*.00077+1.3);
+function snowfall(flakes,t) {
+  const shown=smooth(t/620), gust=wind(t);
+  let font='';
+  ctx.fillStyle=flakes[0].color;
+  for(const p of flakes) {
+    const f0=p.size+'px '+mono;
+    if(f0!==font) ctx.font=font=f0;
+    const f=(p.start+t/snowPeriod*p.speed)%1, y=-10+f*(p.bottom+10);
+    const x=p.x+Math.sin(f*TAU*1.25+p.drift)*p.sway+f*p.sway+gust*p.sway*1.4;
+    ctx.globalAlpha=shown*smooth(f/.08)*smooth((1-f)/.1)*p.alpha;
+    if(p.blur) { ctx.shadowColor=p.color; ctx.shadowBlur=p.blur; }
+    if(p.spin) {
+      ctx.save(); ctx.translate(x,y); ctx.rotate(t*.001*p.spin+p.drift);
+      ctx.fillText(p.ch,0,p.ch==='*'?p.size*.14:0); ctx.restore();
+    } else ctx.fillText(p.ch,x,y-(p.ch==='.'?p.size*.3:0));
+    if(p.blur) ctx.shadowBlur=0;
+  }
+  ctx.globalAlpha=1;
+}
+// ---------- Drawing a frame ----------
+// Redraw every cached layer whenever the canvas's pixels-per-scene-unit changes.
+let detail=0;
+function sharpen(zoom) {
+  const next=Math.min(4,Math.max(1,Math.ceil(zoom*2)/2));
+  if(next===detail) return;
+  detail=next;
+  paintAtlas(next); paintGround(next);
+  for(const frame of dogFrames) frame.art=paintDog(frame,next*dogScale);
+  for(const g of gifts) { g.art=paintMarks(g.body,next/GIFT,[],true); g.lidArt=paintMarks(g.cap,next/GIFT,[],true); }
+}
+function draw(time) {
+  const t=time%cycle;
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.fillStyle='#000';ctx.fillRect(0,0,view.width,view.height);
+  const zoom=Math.min(view.width/540,view.height/553);
+  ctx.setTransform(zoom,0,0,zoom,view.width/2-407*zoom,view.height/2-305*zoom);
+  ctx.textAlign='center';ctx.textBaseline='middle';
+  const growth=clamp((t-startRise)/(fullTree-startRise)),angle=.46+t*.00022;
+  const lit=smooth((t-lightStart)/(lightsReady-lightStart));
+  snowfall(farSnow,t);
+  ctx.globalAlpha=smooth(t/800);
+  ctx.drawImage(ground,groundLeft,groundTop,groundWidth,groundSpan);
+  snowGlints(t);
+  // A dusting of snow under the tree that spreads as it grows, and the ring the strand starts from.
+  const snow=smooth(t/850);
+  for(let i=0;i<155;i++) {
+    const a=hash(i,11)*TAU, r=Math.sqrt(hash(i,13));
+    const x=treeX+Math.cos(a)*r*(60+131*growth),y=foot+8+Math.sin(a)*r*(4+15*growth);
+    ctx.globalAlpha=snow*(.20+.47*(1-r));
+    glyph(ctx,i%7===0?'-':'.',x,y,'#799187',8);
+  }
+  const ringIn=smooth(t/510)*(1-smooth((t-startRise)/950));
+  for(let i=0;i<58;i++) {
+    const a=i/58*TAU;
+    ctx.globalAlpha=ringIn*(.38+.38*Math.cos(a-.55));
+    glyph(ctx,'-',treeX+Math.cos(a)*53,foot+Math.sin(a)*6,'#b6c6a9',8);
+  }
+  ctx.globalAlpha=1;
+  drawStrand(growth,angle,false);
+  drawPine(growth,angle,t,lit);
+  drawStrand(growth,angle,true);
+  lightTree(t,angle,lit);
+  snowfall(midSnow,t);
+  drawGifts(t);
+  drawDog(t);
+  snowfall(nearSnow,t);
+  snowfall(lensSnow,t);
+  if(t>fade) {
+    ctx.setTransform(1,0,0,1,0,0);
+    ctx.fillStyle='rgba(0,0,0,'+smooth((t-fade)/(cycle-fade))+')';
+    ctx.fillRect(0,0,view.width,view.height);
+  }
+}
+// ---------- Playback ----------
+// With reduced motion the scene holds still on the moment the flake lands on the dog's nose.
+let elapsed=motion.matches?contact:0, origin=0, frame=0, running=false, playing=!motion.matches;
+function tick(now) {
+  // A frame's timestamp can predate the moment playback (re)started; never run time backwards.
+  const next=Math.max(0,now-origin);
+  if(Math.floor(next/33)!==Math.floor(elapsed/33)) draw(next);
+  elapsed=next;
+  frame=requestAnimationFrame(tick);
+}
+function stopPlayback() {
+  if(running) elapsed=Math.max(0,performance.now()-origin);
+  running=false; cancelAnimationFrame(frame);
+}
+function syncPlayback() {
+  button.dataset.playing=String(playing);
+  button.setAttribute('aria-label',playing?'Pause animation':'Play animation');
+  draw(elapsed);
+  if(!playing||document.hidden) return;
+  origin=performance.now()-elapsed; running=true;
+  frame=requestAnimationFrame(tick);
+}
+function resize() {
+  const density=Math.min(3,devicePixelRatio||1);
+  view.width=Math.max(1,Math.round(view.clientWidth*density));
+  view.height=Math.max(1,Math.round(view.clientHeight*density));
+  sharpen(Math.min(view.width/540,view.height/553));
+  draw(elapsed);
+}
+function togglePlayback() { stopPlayback(); playing=!playing; syncPlayback(); }
+function replay() { stopPlayback(); elapsed=0; playing=true; syncPlayback(); }
+button.addEventListener('click',togglePlayback);
+document.querySelector('#replay').addEventListener('click',replay);
+view.addEventListener('click',togglePlayback);
+// Space or K toggles playback and R replays, from anywhere. A focused button already
+// answers Space itself, so leave that one alone there.
+addEventListener('keydown',e=>{
+  if(e.repeat||e.metaKey||e.ctrlKey||e.altKey) return;
+  const onButton=e.target instanceof HTMLButtonElement;
+  if((e.code==='Space'&&!onButton)||e.key==='k'||e.key==='K') { e.preventDefault(); togglePlayback(); }
+  else if(e.key==='r'||e.key==='R') { e.preventDefault(); replay(); }
+});
+motion.addEventListener('change',()=>{stopPlayback(); playing=!motion.matches; if(!playing) elapsed=contact; syncPlayback()});
+document.addEventListener('visibilitychange',()=>{stopPlayback(); syncPlayback()});
+new ResizeObserver(resize).observe(view);
+resize(); syncPlayback();
+</script>
+</body>
+</html>
